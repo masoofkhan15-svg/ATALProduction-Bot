@@ -7,7 +7,6 @@ import secrets
 import re
 import urllib.request
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 try:
     sys.stdout.reconfigure(encoding='ascii', errors='replace')
@@ -41,7 +40,9 @@ if not ADMIN_ID_RAW.isdigit():
     raise RuntimeError('ADMIN_ID must be numeric in .env')
 ADMIN_ID = int(ADMIN_ID_RAW)
 
-DB = '/home/container/movies.db'
+DB = os.getenv('DB_PATH', '/tmp/movies.db').strip()
+# Render's free filesystem is writable under /tmp, but is ephemeral.
+# DB_PATH can be overridden later when a persistent database is added.
 conn = sqlite3.connect(DB, check_same_thread=False)
 conn.execute('CREATE TABLE IF NOT EXISTS movies (code TEXT PRIMARY KEY, file_id TEXT NOT NULL, file_type TEXT NOT NULL, caption TEXT, thumbnail_id TEXT)')
 try:
@@ -336,41 +337,53 @@ def handle_callback(q):
                 f'✅ تایید شو، {user_name(user)}! اوس کولی شې فلم ترلاسه کړې.'
             )
 
-class WebhookHandler(BaseHTTPRequestHandler):
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+class TelegramWebhookHandler(BaseHTTPRequestHandler):
+    def _send(self, status, body='OK', content_type='text/plain; charset=utf-8'):
+        raw = body.encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, fmt, *args):
+        print('HTTP: ' + (fmt % args))
+
     def do_GET(self):
-        if self.path in ('/', '/health'):
-            body = b'OK'
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        if self.path in ('/', '/health', '/healthz'):
+            self._send(200, 'AtalBot OK')
         else:
-            self.send_response(404)
-            self.end_headers()
+            self._send(404, 'Not Found')
 
     def do_POST(self):
         if self.path != '/telegram':
-            self.send_response(404)
-            self.end_headers()
+            self._send(404, 'Not Found')
             return
+
         try:
             length = int(self.headers.get('Content-Length', '0'))
+            if length <= 0 or length > 2_000_000:
+                self._send(400, 'Bad Request')
+                return
             raw = self.rfile.read(length)
-            upd = json.loads(raw.decode('utf-8'))
-            if 'message' in upd:
-                handle_message(upd['message'])
-            elif 'callback_query' in upd:
-                handle_callback(upd['callback_query'])
-            self.send_response(200)
-            self.end_headers()
-        except Exception as e:
-            print('Webhook handler error: ' + str(e))
-            self.send_response(200)
-            self.end_headers()
+            update = json.loads(raw.decode('utf-8'))
 
-    def log_message(self, format, *args):
-        return
+            try:
+                if 'message' in update:
+                    handle_message(update['message'])
+                elif 'callback_query' in update:
+                    handle_callback(update['callback_query'])
+            except Exception as e:
+                print('Handler error: ' + str(e))
+
+            # Telegram only needs a successful HTTP response here.
+            self._send(200, 'OK')
+        except Exception as e:
+            print('Webhook error: ' + str(e))
+            self._send(200, 'OK')
 
 
 def main():
@@ -378,25 +391,33 @@ def main():
     if not me.get('ok'):
         raise RuntimeError('BOT_TOKEN is invalid')
 
-    webhook_base = os.getenv('WEBHOOK_URL', '').strip().rstrip('/')
-    if not webhook_base:
-        raise RuntimeError('WEBHOOK_URL is missing')
-
     port = int(os.getenv('PORT', '10000'))
-    webhook_url = webhook_base + '/telegram'
-    result = tg('setWebhook', {
-        'url': webhook_url,
-        'allowed_updates': json.dumps(['message', 'callback_query'])
+    external_url = os.getenv('RENDER_EXTERNAL_URL', '').strip().rstrip('/')
+    webhook_url = os.getenv('WEBHOOK_URL', '').strip().rstrip('/') or external_url
+    if not webhook_url:
+        raise RuntimeError('WEBHOOK_URL is missing and RENDER_EXTERNAL_URL is not available')
+
+    # Remove any previous webhook configuration and install this service's URL.
+    set_result = tg('setWebhook', {
+        'url': webhook_url + '/telegram',
+        'allowed_updates': json.dumps(['message', 'callback_query']),
+        'drop_pending_updates': 'false'
     })
-    if not result.get('ok'):
-        raise RuntimeError('Could not set Telegram webhook: ' + str(result.get('description', 'unknown error')))
+    if not set_result.get('ok'):
+        raise RuntimeError('Could not set Telegram webhook: ' + str(set_result.get('description', 'unknown error')))
 
-    print('AtalBot webhook is running...')
-    print('Webhook: ' + webhook_url)
-    print('Port: ' + str(port))
+    print('AtalBot is running in webhook mode...')
+    print('Webhook: ' + webhook_url + '/telegram')
+    print('Channel configured: ' + CHANNEL_USERNAME)
+    print('Listening on 0.0.0.0:' + str(port))
 
-    server = HTTPServer(('0.0.0.0', port), WebhookHandler)
-    server.serve_forever()
+    server = ThreadingHTTPServer(('0.0.0.0', port), TelegramWebhookHandler)
+    server.daemon_threads = True
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
 
 if __name__ == '__main__':
     main()
